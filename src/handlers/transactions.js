@@ -2,7 +2,7 @@
 
 const { ok, badRequest, notFound, conflict, serverError, parseJsonBody } = require("../lib/response");
 const { docClient, TABLES } = require("../lib/dynamodb");
-const { GetCommand, UpdateCommand, TransactWriteCommand } = require("@aws-sdk/lib-dynamodb");
+const { GetCommand, TransactWriteCommand } = require("@aws-sdk/lib-dynamodb");
 const { validateAmount } = require("../lib/validate");
 const {
   buildIdempotencyClaimItem,
@@ -13,105 +13,107 @@ const {
 
 const VALID_CURRENCIES = new Set(["CAD", "USD"]);
 
-/**
- * Fetches an account from DynamoDB. Returns the Item or null.
- * Throws on unexpected errors.
- */
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
 async function fetchAccount(accountId) {
   const result = await docClient.send(
-    new GetCommand({
-      TableName: TABLES.accounts,
-      Key: { accountId },
-    })
+    new GetCommand({ TableName: TABLES.accounts, Key: { accountId } })
   );
   return result.Item ?? null;
 }
 
-/**
- * Extracts the Idempotency-Key header (case-insensitive).
- * API Gateway lowercases headers; serverless-offline preserves case.
- */
 function extractIdempotencyKey(event) {
-  const headers = event.headers ?? {};
-  return headers["idempotency-key"] || headers["Idempotency-Key"] || null;
+  const h = event.headers ?? {};
+  return h["idempotency-key"] || h["Idempotency-Key"] || null;
 }
 
 /**
  * Core idempotency gate used by all three write handlers.
  *
- * Flow:
- *  1. If key already DONE  → return cached response immediately (safe retry)
- *  2. If key PROCESSING    → another request is in flight; wait for it to DONE
- *  3. If NOT_FOUND         → build & execute a TransactWriteCommand that atomically
- *                            claims the key (Put with attribute_not_exists) AND
- *                            runs the business operation (balance update).
- *                            Only ONE request wins this race.
- *  4. Loser of the race    → TransactionCanceledException on the idempotency Put
- *                            → wait for the winner to resolve, then return its response.
- *  5. Winner               → resolve idempotency record to DONE with the HTTP response.
+ * @param {string|null} key
+ *   Idempotency-Key from the request header; null = skip idempotency.
  *
- * @param {string|null} key          - Idempotency-Key from the request header
- * @param {function}    buildItems   - Returns the non-idempotency TransactItems[]
- * @param {function}    buildResponse- Builds the success HTTP response from the transaction result
+ * @param {function} buildTransactItems
+ *   Returns the array of TransactItems for the business operation (without
+ *   the idempotency Put — that is prepended automatically when key is set).
+ *
+ * @param {object} recoveryMeta
+ *   Crash-recovery metadata stored inside the PROCESSING record so that
+ *   waitForResolution() can self-heal if the winner Lambda crashes:
+ *     verifyAccountId       — account to read to confirm the tx ran
+ *     verifyExpectedBalance — balance value that proves the tx ran
+ *     recoveryStatusCode    — HTTP status to replay on self-heal
+ *     recoveryBody          — JSON body string to replay on self-heal
+ *
+ * @param {function} buildSuccessResponse
+ *   Builds the final HTTP response object after a winning transaction.
  */
-async function runWithIdempotency(key, buildItems, buildResponse) {
-  // ── No idempotency key supplied — just run the transaction normally ──────
+async function runWithIdempotency(key, buildTransactItems, recoveryMeta, buildSuccessResponse) {
+
+  // ── No key: plain transaction, no idempotency overhead ───────────────────
   if (!key) {
     try {
-      const result = await docClient.send(
-        new TransactWriteCommand({ TransactItems: buildItems() })
+      await docClient.send(
+        new TransactWriteCommand({ TransactItems: buildTransactItems() })
       );
-      return buildResponse(result);
     } catch (err) {
-      return handleTransactionError(err);
+      return handleTransactionError(err, 1); // business items start at index 0
     }
+    return buildSuccessResponse();
   }
 
-  // ── Check whether we've seen this key before ─────────────────────────────
+  // ── Key present: check cache first (fast-path for already-resolved retries) ─
   let check;
   try {
     check = await checkIdempotency(key);
   } catch (err) {
     console.error("Idempotency check failed:", err);
-    // Non-fatal: fall through and treat as NOT_FOUND
     check = { state: "NOT_FOUND" };
   }
 
   if (check.state === "DONE") {
-    return check.response; // Safe replay — no DB write
+    return check.response; // ← safe replay, no DB write
   }
 
   if (check.state === "PROCESSING") {
-    // Another request is already in flight with this key — wait for it
+    // Another request is in-flight (or the winner crashed).
+    // waitForResolution polls for DONE and also runs crash-recovery.
     const resolved = await waitForResolution(key);
     if (resolved) return resolved;
-    // Winner crashed before resolving — tell client to use a fresh key
     return conflict(
       "A concurrent request with this Idempotency-Key is still processing. " +
       "Please retry with a new Idempotency-Key."
     );
   }
 
-  // ── First time seeing this key — build the atomic transaction ────────────
-  // Bundle: [claim idempotency key] + [business operation items]
+  // ── First time seeing this key: build atomic transaction ─────────────────
+  //
+  // TransactItems layout:
+  //   [0]  idempotency Put  (attribute_not_exists condition — the race lock)
+  //   [1+] business operation items (balance Update, etc.)
+  //
+  // If two requests race here, only ONE transaction succeeds.
+  // The loser gets TransactionCanceledException with
+  // CancellationReasons[0].Code = "ConditionalCheckFailed".
+  // Because item[0] and item[1+] are in the SAME transaction, the loser's
+  // balance Update is also cancelled — zero double-charge (Problems 1 & 2).
+
   const transactItems = [
-    { Put: buildIdempotencyClaimItem(key) },
-    ...buildItems(),
+    { Put: buildIdempotencyClaimItem(key, recoveryMeta) },
+    ...buildTransactItems(),
   ];
 
-  let result;
   try {
-    result = await docClient.send(
-      new TransactWriteCommand({ TransactItems: transactItems })
-    );
+    await docClient.send(new TransactWriteCommand({ TransactItems: transactItems }));
   } catch (err) {
-    // Check whether the idempotency Put was the one that failed (we lost the race)
     if (
       err.name === "TransactionCanceledException" &&
       err.CancellationReasons?.[0]?.Code === "ConditionalCheckFailed"
     ) {
-      // We lost the race — the first TransactItem (idempotency Put) was rejected.
-      // Wait for the winner to write its DONE response.
+      // We lost the race on the idempotency Put (item[0]).
+      // Wait for the winner to resolve, then replay its response.
       const resolved = await waitForResolution(key);
       if (resolved) return resolved;
       return conflict(
@@ -119,32 +121,41 @@ async function runWithIdempotency(key, buildItems, buildResponse) {
         "Please retry with a new Idempotency-Key."
       );
     }
-    // Otherwise it's a business-logic failure (insufficient funds, closed account, etc.)
-    return handleTransactionError(err);
+    // Business-logic failure (insufficient funds, closed account, etc.)
+    // Business items start at index 1 when idempotency is included.
+    return handleTransactionError(err, 1);
   }
 
-  // ── We won — build the response and persist it ───────────────────────────
-  const response = buildResponse(result);
+  // ── We won the race: build response and resolve the PROCESSING record ─────
+  //
+  // The window between here and resolveIdempotency() is the only remaining
+  // crash risk (Problem 3).  It is handled by crash-recovery in
+  // waitForResolution() using the verifyExpectedBalance stored in the
+  // PROCESSING record above — if the winner crashes here, the next caller
+  // that times out will read the account balance, confirm it matches
+  // verifyExpectedBalance, and self-resolve the record to DONE.
+
+  const response = buildSuccessResponse();
 
   try {
     await resolveIdempotency(key, response);
   } catch (err) {
-    // Should not happen in practice, but log and continue — the money already moved.
-    console.error("Failed to resolve idempotency record:", err);
+    // Should not happen in practice, but the money already moved safely.
+    // Log and continue — crash-recovery will self-heal on the next retry.
+    console.error("Failed to resolve idempotency record after winning transaction:", err);
   }
 
   return response;
 }
 
 /**
- * Translates a TransactionCanceledException into an appropriate HTTP response.
- * The idempotency Put is always index 0 when present — business conditions
- * start at index 1 for deposit/withdraw and indices 1-2 for transfer.
+ * Maps a TransactionCanceledException to the right HTTP response.
+ * `businessStartIndex` is the offset in CancellationReasons where the
+ * business items begin (1 when idempotency Put is item[0], 0 otherwise).
  */
-function handleTransactionError(err) {
+function handleTransactionError(err, businessStartIndex = 0) {
   if (err.name === "TransactionCanceledException") {
-    const reasons = err.CancellationReasons ?? [];
-    // Business condition failed (insufficient funds or account not OPEN)
+    const reasons = (err.CancellationReasons ?? []).slice(businessStartIndex);
     if (reasons.some((r) => r.Code === "ConditionalCheckFailed")) {
       return conflict("Insufficient funds or account is no longer OPEN");
     }
@@ -154,18 +165,17 @@ function handleTransactionError(err) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// DEPOSIT
+// DEPOSIT  POST /accounts/{accountId}/deposits
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * POST /accounts/{accountId}/deposits
- *
  * Credits the account balance.
- * - amount must be > 0 with at most 2 decimal places
- * - currency must match the account's currency
+ * - amount > 0, max 2 decimal places
+ * - currency must match account currency
  * - account must be OPEN
- * - Idempotency-Key header atomically prevents double-credits on retry
- * - Returns 200 with the updated Account
+ * - Idempotency-Key atomically prevents double-credits on retry or race
+ * - Crash-safe: if Lambda dies after the transaction, the next retry
+ *   self-heals by verifying the account balance
  */
 async function deposit(event) {
   const accountId = event.pathParameters?.accountId;
@@ -183,7 +193,6 @@ async function deposit(event) {
   if (!amtResult.ok) return badRequest(amtResult.message);
   const amt = amtResult.value;
 
-  // Validate account exists and is eligible before entering the transaction
   let account;
   try {
     account = await fetchAccount(accountId);
@@ -201,44 +210,49 @@ async function deposit(event) {
     );
   }
 
-  const idempotencyKey = extractIdempotencyKey(event);
+  const expectedBalance = Math.round((account.balance + amt) * 100) / 100;
+  const successResponse  = ok({ ...account, balance: expectedBalance });
 
   return runWithIdempotency(
-    idempotencyKey,
+    extractIdempotencyKey(event),
 
-    // TransactItems builder (index 0 is reserved for the idempotency Put when key is set)
-    () => [
-      {
-        Update: {
-          TableName: TABLES.accounts,
-          Key: { accountId },
-          UpdateExpression: "SET balance = balance + :amt",
-          ConditionExpression: "#status = :open",
-          ExpressionAttributeNames: { "#status": "status" },
-          ExpressionAttributeValues: { ":amt": amt, ":open": "OPEN" },
-        },
+    // Business TransactItems
+    () => [{
+      Update: {
+        TableName: TABLES.accounts,
+        Key: { accountId },
+        UpdateExpression: "SET balance = balance + :amt",
+        ConditionExpression: "#status = :open",
+        ExpressionAttributeNames: { "#status": "status" },
+        ExpressionAttributeValues: { ":amt": amt, ":open": "OPEN" },
       },
-    ],
+    }],
 
-    // Response builder — compute new balance from known pre-tx value
-    () => ok({ ...account, balance: Math.round((account.balance + amt) * 100) / 100 })
+    // Crash-recovery metadata stored in the PROCESSING record
+    {
+      verifyAccountId:       accountId,
+      verifyExpectedBalance: expectedBalance,
+      recoveryStatusCode:    successResponse.statusCode,
+      recoveryBody:          successResponse.body,
+    },
+
+    // Success response builder
+    () => successResponse
   );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// WITHDRAW
+// WITHDRAW  POST /accounts/{accountId}/withdrawals
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * POST /accounts/{accountId}/withdrawals
- *
  * Debits the account balance.
- * - amount must be > 0 with at most 2 decimal places
- * - currency must match the account's currency
+ * - amount > 0, max 2 decimal places
+ * - currency must match account currency
  * - account must be OPEN
  * - Returns 409 if balance < amount (insufficient funds)
- * - Idempotency-Key header atomically prevents double-debits on retry
- * - Returns 200 with the updated Account
+ * - Idempotency-Key atomically prevents double-debits on retry or race
+ * - Crash-safe: self-heals on the next retry via balance verification
  */
 async function withdraw(event) {
   const accountId = event.pathParameters?.accountId;
@@ -273,39 +287,44 @@ async function withdraw(event) {
     );
   }
 
-  const idempotencyKey = extractIdempotencyKey(event);
+  const expectedBalance = Math.round((account.balance - amt) * 100) / 100;
+  const successResponse  = ok({ ...account, balance: expectedBalance });
 
   return runWithIdempotency(
-    idempotencyKey,
+    extractIdempotencyKey(event),
 
-    () => [
-      {
-        Update: {
-          TableName: TABLES.accounts,
-          Key: { accountId },
-          UpdateExpression: "SET balance = balance - :amt",
-          // Atomically: account still OPEN AND has sufficient funds
-          ConditionExpression: "#status = :open AND balance >= :amt",
-          ExpressionAttributeNames: { "#status": "status" },
-          ExpressionAttributeValues: { ":amt": amt, ":open": "OPEN" },
-        },
+    () => [{
+      Update: {
+        TableName: TABLES.accounts,
+        Key: { accountId },
+        UpdateExpression: "SET balance = balance - :amt",
+        // Atomically: account still OPEN AND has sufficient funds
+        ConditionExpression: "#status = :open AND balance >= :amt",
+        ExpressionAttributeNames: { "#status": "status" },
+        ExpressionAttributeValues: { ":amt": amt, ":open": "OPEN" },
       },
-    ],
+    }],
 
-    () => ok({ ...account, balance: Math.round((account.balance - amt) * 100) / 100 })
+    {
+      verifyAccountId:       accountId,
+      verifyExpectedBalance: expectedBalance,
+      recoveryStatusCode:    successResponse.statusCode,
+      recoveryBody:          successResponse.body,
+    },
+
+    () => successResponse
   );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TRANSFER
+// TRANSFER  POST /transfers
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * POST /transfers
- *
  * Moves funds between two accounts atomically.
- * - Idempotency-Key atomically prevents double-transfers on retry
  * - Both accounts must be OPEN and share the same currency
+ * - Idempotency-Key atomically prevents double-transfers on retry or race
+ * - Crash-safe: verifies the source account balance for self-healing
  * - Returns 200: { fromAccount, toAccount }
  */
 async function transfer(event) {
@@ -315,7 +334,7 @@ async function transfer(event) {
   const { fromAccountId, toAccountId, currency } = parsed.data;
 
   if (!fromAccountId || typeof fromAccountId !== "string") return badRequest("fromAccountId is required");
-  if (!toAccountId || typeof toAccountId !== "string") return badRequest("toAccountId is required");
+  if (!toAccountId   || typeof toAccountId   !== "string") return badRequest("toAccountId is required");
   if (fromAccountId === toAccountId) return badRequest("fromAccountId and toAccountId must be different");
   if (!currency || !VALID_CURRENCIES.has(currency)) {
     return badRequest(`currency must be one of: ${[...VALID_CURRENCIES].join(", ")}`);
@@ -337,8 +356,7 @@ async function transfer(event) {
   }
 
   if (!fromAccount) return notFound(`Source account '${fromAccountId}' not found`);
-  if (!toAccount) return notFound(`Destination account '${toAccountId}' not found`);
-
+  if (!toAccount)   return notFound(`Destination account '${toAccountId}' not found`);
   if (fromAccount.status !== "OPEN") {
     return conflict(`Source account '${fromAccountId}' is ${fromAccount.status} and cannot send transfers`);
   }
@@ -352,10 +370,15 @@ async function transfer(event) {
     return badRequest(`Currency mismatch: destination account currency is ${toAccount.currency}`);
   }
 
-  const idempotencyKey = extractIdempotencyKey(event);
+  const expectedFromBalance = Math.round((fromAccount.balance - amt) * 100) / 100;
+  const expectedToBalance   = Math.round((toAccount.balance   + amt) * 100) / 100;
+  const successResponse = ok({
+    fromAccount: { ...fromAccount, balance: expectedFromBalance },
+    toAccount:   { ...toAccount,   balance: expectedToBalance   },
+  });
 
   return runWithIdempotency(
-    idempotencyKey,
+    extractIdempotencyKey(event),
 
     () => [
       {
@@ -363,6 +386,7 @@ async function transfer(event) {
           TableName: TABLES.accounts,
           Key: { accountId: fromAccountId },
           UpdateExpression: "SET balance = balance - :amt",
+          // Atomically: source account still OPEN AND has sufficient funds
           ConditionExpression: "#status = :open AND balance >= :amt",
           ExpressionAttributeNames: { "#status": "status" },
           ExpressionAttributeValues: { ":amt": amt, ":open": "OPEN" },
@@ -373,6 +397,7 @@ async function transfer(event) {
           TableName: TABLES.accounts,
           Key: { accountId: toAccountId },
           UpdateExpression: "SET balance = balance + :amt",
+          // Atomically: destination account still OPEN
           ConditionExpression: "#status = :open",
           ExpressionAttributeNames: { "#status": "status" },
           ExpressionAttributeValues: { ":amt": amt, ":open": "OPEN" },
@@ -380,10 +405,16 @@ async function transfer(event) {
       },
     ],
 
-    () => ok({
-      fromAccount: { ...fromAccount, balance: Math.round((fromAccount.balance - amt) * 100) / 100 },
-      toAccount:   { ...toAccount,   balance: Math.round((toAccount.balance   + amt) * 100) / 100 },
-    })
+    // Verify via the source account — if its balance dropped by `amt`,
+    // the whole atomic transaction ran (both sides moved).
+    {
+      verifyAccountId:       fromAccountId,
+      verifyExpectedBalance: expectedFromBalance,
+      recoveryStatusCode:    successResponse.statusCode,
+      recoveryBody:          successResponse.body,
+    },
+
+    () => successResponse
   );
 }
 
