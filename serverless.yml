@@ -11,6 +11,7 @@ provider:
     DYNAMODB_ENDPOINT: ${env:DYNAMODB_ENDPOINT, 'http://localhost:8000'}
     CUSTOMERS_TABLE: ${env:CUSTOMERS_TABLE, 'Customers'}
     ACCOUNTS_TABLE: ${env:ACCOUNTS_TABLE, 'Accounts'}
+    IDEMPOTENCY_TABLE: ${env:IDEMPOTENCY_TABLE, 'Idempotency'}
   # IAM is unused for local DynamoDB; kept for realism if you later deploy to AWS
   iam:
     role:

@@ -11,6 +11,7 @@ const endpoint = process.env.DYNAMODB_ENDPOINT || "http://localhost:8000";
 const region = process.env.AWS_REGION || "us-east-1";
 const customersTable = process.env.CUSTOMERS_TABLE || "Customers";
 const accountsTable = process.env.ACCOUNTS_TABLE || "Accounts";
+const idempotencyTable = process.env.IDEMPOTENCY_TABLE || "Idempotency";
 
 const client = new DynamoDBClient({
   region,
@@ -67,6 +68,16 @@ async function main() {
         Projection: { ProjectionType: "ALL" },
       },
     ],
+    BillingMode: "PAY_PER_REQUEST",
+  });
+
+  // Idempotency table — stores write-API responses keyed by client-supplied
+  // Idempotency-Key header. TTL attribute lets DynamoDB auto-expire entries
+  // after 24 hours (enable TTL on the "ttl" attribute in AWS console / IaC).
+  await recreateTable(idempotencyTable, {
+    TableName: idempotencyTable,
+    AttributeDefinitions: [{ AttributeName: "idempotencyKey", AttributeType: "S" }],
+    KeySchema: [{ AttributeName: "idempotencyKey", KeyType: "HASH" }],
     BillingMode: "PAY_PER_REQUEST",
   });
 
