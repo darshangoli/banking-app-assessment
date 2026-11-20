@@ -193,7 +193,7 @@ async function waitForResolution(key) {
   let lastRecord = null;
 
   while (Date.now() < deadline) {
-    await sleep(RESOLVE_POLL_MS);
+    await getSleep()(RESOLVE_POLL_MS);
 
     const check = await checkIdempotency(key);
 
@@ -294,9 +294,15 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// Use module.exports reference so tests can replace _sleep with a no-op
+function getSleep() {
+  return module.exports._sleep;
+}
+
 module.exports = {
   buildIdempotencyClaimItem,
   resolveIdempotency,
   checkIdempotency,
   waitForResolution,
+  _sleep: sleep, // exported for testing only — allows tests to mock sleep to no-op
 };

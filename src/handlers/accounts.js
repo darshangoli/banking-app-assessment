@@ -3,6 +3,7 @@
 const { ok, created, badRequest, notFound, serverError, parseJsonBody } = require("../lib/response");
 const { docClient, TABLES } = require("../lib/dynamodb");
 const { GetCommand, PutCommand, QueryCommand, ScanCommand } = require("@aws-sdk/lib-dynamodb");
+const { requireAuth, assertOwner } = require("../lib/auth-middleware");
 
 const VALID_TYPES = new Set(["CHECKING", "SAVINGS"]);
 const VALID_CURRENCIES = new Set(["CAD", "USD"]);
@@ -35,12 +36,20 @@ async function nextAccountId() {
  * Validates that the customer exists, then creates an account with the given
  * type and currency. initialBalance defaults to 0 and must be >= 0.
  * Returns 201 with the created Account, or 404 if the customer is not found.
+ *
+ * Protected: only the authenticated customer may create accounts for themselves.
  */
 async function create(event) {
+  const authResult = requireAuth(event);
+  if (authResult.error) return authResult.error;
+
   const customerId = event.pathParameters?.customerId;
   if (!customerId) {
     return badRequest("customerId path parameter is required");
   }
+
+  const ownerCheck = assertOwner(authResult.customerId, customerId);
+  if (ownerCheck) return ownerCheck;
   const parsed = parseJsonBody(event);
   if (!parsed.ok) {
     return parsed.response;
@@ -110,18 +119,19 @@ async function create(event) {
  * Lists accounts for a customer using a Query on the CustomerIdIndex GSI.
  * Supports cursor-based pagination via `limit` and `nextToken` query params.
  *
- * Query parameters:
- *   limit     — max items to return per page (default 20, max 100)
- *   nextToken — opaque base64 cursor returned from a previous response
- *
- * Returns 404 if the customer does not exist.
- * Returns { items, nextToken } where nextToken is null on the last page.
+ * Protected: only the authenticated customer may list their own accounts.
  */
 async function list(event) {
+  const authResult = requireAuth(event);
+  if (authResult.error) return authResult.error;
+
   const customerId = event.pathParameters?.customerId;
   if (!customerId) {
     return badRequest("customerId path parameter is required");
   }
+
+  const ownerCheck = assertOwner(authResult.customerId, customerId);
+  if (ownerCheck) return ownerCheck;
 
   // Parse and clamp limit
   const rawLimit = parseInt(event.queryStringParameters?.limit, 10);
@@ -184,8 +194,13 @@ async function list(event) {
  *
  * Fetches a single account by accountId (includes balance).
  * Returns 200 with Account, or 404 if not found.
+ *
+ * Protected: only the account's owner (customerId on the account) may read it.
  */
 async function get(event) {
+  const authResult = requireAuth(event);
+  if (authResult.error) return authResult.error;
+
   const accountId = event.pathParameters?.accountId;
   if (!accountId) {
     return badRequest("accountId path parameter is required");
@@ -200,6 +215,10 @@ async function get(event) {
     if (!result.Item) {
       return notFound(`Account '${accountId}' not found`);
     }
+    // Ownership check: authenticated customer must own this account
+    const ownerCheck = assertOwner(authResult.customerId, result.Item.customerId);
+    if (ownerCheck) return ownerCheck;
+
     return ok(result.Item);
   } catch (err) {
     console.error("DynamoDB GetCommand failed (accounts):", err);

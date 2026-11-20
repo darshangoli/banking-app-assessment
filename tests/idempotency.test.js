@@ -21,7 +21,14 @@ jest.mock("../src/lib/dynamodb", () => ({
     customers:   "Customers",
     accounts:    "Accounts",
     idempotency: "Idempotency",
+    users:       "Users",
   },
+}));
+
+// ─── Mock auth middleware — always authenticated ──────────────────────────────
+jest.mock("../src/lib/auth-middleware", () => ({
+  requireAuth: () => ({ customerId: "cust_001", email: "test@example.com" }),
+  assertOwner: () => null,
 }));
 
 const { docClient } = require("../src/lib/dynamodb");

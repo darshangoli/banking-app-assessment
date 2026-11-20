@@ -13,7 +13,13 @@
 // ─── Mock the DynamoDB document client ───────────────────────────────────────
 jest.mock("../src/lib/dynamodb", () => ({
   docClient: { send: jest.fn() },
-  TABLES: { customers: "Customers", accounts: "Accounts" },
+  TABLES: { customers: "Customers", accounts: "Accounts", idempotency: "Idempotency", users: "Users" },
+}));
+
+// ─── Mock auth middleware — always authenticated as cust_001 ─────────────────
+jest.mock("../src/lib/auth-middleware", () => ({
+  requireAuth: () => ({ customerId: "cust_001", email: "test@example.com" }),
+  assertOwner: () => null,
 }));
 
 const { docClient } = require("../src/lib/dynamodb");
@@ -174,7 +180,7 @@ describe("GET /customers/{customerId}/accounts", () => {
 
     const res = await list(makeEvent({ pathParameters: { customerId: "cust_001" } }));
     expect(res.statusCode).toBe(200);
-    expect(parseBody(res)).toEqual({ items: accounts });
+    expect(parseBody(res)).toEqual({ items: accounts, nextToken: null });
   });
 
   test("404 – customer not found", async () => {
@@ -215,10 +221,9 @@ describe("POST /accounts/{accountId}/deposits", () => {
   beforeEach(() => docClient.send.mockReset());
 
   test("200 – deposits successfully", async () => {
-    const updated = { accountId: "acct_001", customerId: "cust_001", balance: 300, currency: "CAD", type: "CHECKING", status: "OPEN", createdAt: "2024-01-01T00:00:00Z" };
     docClient.send
-      .mockResolvedValueOnce({ Item: { accountId: "acct_001", currency: "CAD", balance: 250 } }) // GetCommand
-      .mockResolvedValueOnce({ Attributes: updated }); // UpdateCommand
+      .mockResolvedValueOnce({ Item: { accountId: "acct_001", currency: "CAD", balance: 250, status: "OPEN" } }) // pre-check GET
+      .mockResolvedValueOnce({}); // TransactWriteCommand
 
     const res = await deposit(makeEvent({
       pathParameters: { accountId: "acct_001" },
@@ -237,7 +242,7 @@ describe("POST /accounts/{accountId}/deposits", () => {
   });
 
   test("400 – currency mismatch", async () => {
-    docClient.send.mockResolvedValueOnce({ Item: { accountId: "acct_001", currency: "CAD", balance: 250 } });
+    docClient.send.mockResolvedValueOnce({ Item: { accountId: "acct_001", currency: "CAD", balance: 250, status: "OPEN" } });
 
     const res = await deposit(makeEvent({
       pathParameters: { accountId: "acct_001" },
@@ -263,10 +268,9 @@ describe("POST /accounts/{accountId}/withdrawals", () => {
   beforeEach(() => docClient.send.mockReset());
 
   test("200 – withdraws successfully", async () => {
-    const updated = { accountId: "acct_001", balance: 200, currency: "CAD", type: "CHECKING", status: "OPEN", createdAt: "2024-01-01T00:00:00Z" };
     docClient.send
-      .mockResolvedValueOnce({ Item: { accountId: "acct_001", currency: "CAD", balance: 250 } })
-      .mockResolvedValueOnce({ Attributes: updated });
+      .mockResolvedValueOnce({ Item: { accountId: "acct_001", currency: "CAD", balance: 250, status: "OPEN" } }) // pre-check GET
+      .mockResolvedValueOnce({}); // TransactWriteCommand
 
     const res = await withdraw(makeEvent({
       pathParameters: { accountId: "acct_001" },
@@ -277,9 +281,14 @@ describe("POST /accounts/{accountId}/withdrawals", () => {
   });
 
   test("409 – insufficient funds", async () => {
+    const txError = Object.assign(new Error("Transaction cancelled"), {
+      name: "TransactionCanceledException",
+      // No idempotency key → business item is at index 0
+      CancellationReasons: [{ Code: "ConditionalCheckFailed" }],
+    });
     docClient.send
-      .mockResolvedValueOnce({ Item: { accountId: "acct_001", currency: "CAD", balance: 10 } })
-      .mockRejectedValueOnce(Object.assign(new Error("ConditionalCheckFailed"), { name: "ConditionalCheckFailedException" }));
+      .mockResolvedValueOnce({ Item: { accountId: "acct_001", currency: "CAD", balance: 10, status: "OPEN" } })
+      .mockRejectedValueOnce(txError);
 
     const res = await withdraw(makeEvent({
       pathParameters: { accountId: "acct_001" },
@@ -296,37 +305,33 @@ describe("POST /transfers", () => {
   beforeEach(() => docClient.send.mockReset());
 
   test("200 – transfer completes", async () => {
-    const fromAcc = { accountId: "acct_001", currency: "CAD", balance: 250 };
-    const toAcc = { accountId: "acct_002", currency: "CAD", balance: 100 };
-    const fromUpdated = { ...fromAcc, balance: 200 };
-    const toUpdated = { ...toAcc, balance: 150 };
+    const fromAcc = { accountId: "acct_001", currency: "CAD", balance: 250, status: "OPEN" };
+    const toAcc   = { accountId: "acct_002", currency: "CAD", balance: 100, status: "OPEN" };
 
     docClient.send
-      .mockResolvedValueOnce({ Item: fromAcc })   // fetchAccount(fromAccountId)
-      .mockResolvedValueOnce({ Item: toAcc })     // fetchAccount(toAccountId)
-      .mockResolvedValueOnce({})                  // TransactWriteCommand
-      .mockResolvedValueOnce({ Item: fromUpdated }) // re-fetch from
-      .mockResolvedValueOnce({ Item: toUpdated });  // re-fetch to
+      .mockResolvedValueOnce({ Item: fromAcc }) // fetchAccount(from)
+      .mockResolvedValueOnce({ Item: toAcc })   // fetchAccount(to)
+      .mockResolvedValueOnce({});               // TransactWriteCommand
 
     const res = await transfer(makeEvent({
       body: jsonBody({ fromAccountId: "acct_001", toAccountId: "acct_002", amount: 50, currency: "CAD" }),
     }));
     expect(res.statusCode).toBe(200);
     const body = parseBody(res);
-    expect(body.fromAccount.balance).toBe(200);
-    expect(body.toAccount.balance).toBe(150);
+    expect(body.fromAccount.balance).toBe(200); // 250 - 50
+    expect(body.toAccount.balance).toBe(150);   // 100 + 50
   });
 
   test("409 – insufficient funds in source", async () => {
+    const txError = Object.assign(new Error("Transaction cancelled"), {
+      name: "TransactionCanceledException",
+      // No idempotency key → business items start at index 0
+      CancellationReasons: [{ Code: "ConditionalCheckFailed" }, { Code: "None" }],
+    });
     docClient.send
-      .mockResolvedValueOnce({ Item: { accountId: "acct_001", currency: "CAD", balance: 10 } })
-      .mockResolvedValueOnce({ Item: { accountId: "acct_002", currency: "CAD", balance: 100 } })
-      .mockRejectedValueOnce(
-        Object.assign(new Error("Transaction cancelled"), {
-          name: "TransactionCanceledException",
-          CancellationReasons: [{ Code: "ConditionalCheckFailed" }, { Code: "None" }],
-        })
-      );
+      .mockResolvedValueOnce({ Item: { accountId: "acct_001", currency: "CAD", balance: 10, status: "OPEN" } })
+      .mockResolvedValueOnce({ Item: { accountId: "acct_002", currency: "CAD", balance: 100, status: "OPEN" } })
+      .mockRejectedValueOnce(txError);
 
     const res = await transfer(makeEvent({
       body: jsonBody({ fromAccountId: "acct_001", toAccountId: "acct_002", amount: 500, currency: "CAD" }),
@@ -344,7 +349,7 @@ describe("POST /transfers", () => {
   test("404 – source account not found", async () => {
     docClient.send
       .mockResolvedValueOnce({ Item: undefined })
-      .mockResolvedValueOnce({ Item: { accountId: "acct_002", currency: "CAD", balance: 100 } });
+      .mockResolvedValueOnce({ Item: { accountId: "acct_002", currency: "CAD", balance: 100, status: "OPEN" } });
 
     const res = await transfer(makeEvent({
       body: jsonBody({ fromAccountId: "acct_ghost", toAccountId: "acct_002", amount: 10, currency: "CAD" }),

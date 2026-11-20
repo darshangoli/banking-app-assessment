@@ -9,9 +9,12 @@ provider:
   region: ${env:AWS_REGION, 'us-east-1'}
   environment:
     DYNAMODB_ENDPOINT: ${env:DYNAMODB_ENDPOINT, 'http://localhost:8000'}
-    CUSTOMERS_TABLE: ${env:CUSTOMERS_TABLE, 'Customers'}
-    ACCOUNTS_TABLE: ${env:ACCOUNTS_TABLE, 'Accounts'}
-    IDEMPOTENCY_TABLE: ${env:IDEMPOTENCY_TABLE, 'Idempotency'}
+    CUSTOMERS_TABLE:   ${env:CUSTOMERS_TABLE,   'Customers'}
+    ACCOUNTS_TABLE:    ${env:ACCOUNTS_TABLE,     'Accounts'}
+    IDEMPOTENCY_TABLE: ${env:IDEMPOTENCY_TABLE,  'Idempotency'}
+    USERS_TABLE:       ${env:USERS_TABLE,        'Users'}
+    JWT_SECRET:        ${env:JWT_SECRET,         'dev-secret-change-in-production-min-32-chars'}
+    JWT_EXPIRES_IN:    ${env:JWT_EXPIRES_IN,     '24h'}
   # IAM is unused for local DynamoDB; kept for realism if you later deploy to AWS
   iam:
     role:
@@ -35,6 +38,11 @@ custom:
     noPrependStageInUrl: true
 
 functions:
+  # ── Lambda Authorizer ───────────────────────────────────────────────────────
+  jwtAuthorizer:
+    handler: src/handlers/auth.jwtAuthorizer
+
+  # ── Public routes (no JWT required) ────────────────────────────────────────
   docsUi:
     handler: src/handlers/docs.ui
     events:
@@ -49,12 +57,29 @@ functions:
           path: openapi.yaml
           method: get
 
+  # ── Auth routes (public) ────────────────────────────────────────────────────
+  authRegister:
+    handler: src/handlers/auth.register
+    events:
+      - http:
+          path: auth/register
+          method: post
+
+  authLogin:
+    handler: src/handlers/auth.login
+    events:
+      - http:
+          path: auth/login
+          method: post
+
+  # ── Protected routes ────────────────────────────────────────────────────────
   createCustomer:
     handler: src/handlers/customers.create
     events:
       - http:
           path: customers
           method: post
+          authorizer: jwtAuthorizer
 
   getCustomer:
     handler: src/handlers/customers.get
@@ -62,6 +87,7 @@ functions:
       - http:
           path: customers/{customerId}
           method: get
+          authorizer: jwtAuthorizer
 
   createAccount:
     handler: src/handlers/accounts.create
@@ -69,6 +95,7 @@ functions:
       - http:
           path: customers/{customerId}/accounts
           method: post
+          authorizer: jwtAuthorizer
 
   listAccounts:
     handler: src/handlers/accounts.list
@@ -76,6 +103,7 @@ functions:
       - http:
           path: customers/{customerId}/accounts
           method: get
+          authorizer: jwtAuthorizer
 
   getAccount:
     handler: src/handlers/accounts.get
@@ -83,14 +111,15 @@ functions:
       - http:
           path: accounts/{accountId}
           method: get
+          authorizer: jwtAuthorizer
 
-  # Optional stretch goals — stubs included for mid-senior candidates
   deposit:
     handler: src/handlers/transactions.deposit
     events:
       - http:
           path: accounts/{accountId}/deposits
           method: post
+          authorizer: jwtAuthorizer
 
   withdraw:
     handler: src/handlers/transactions.withdraw
@@ -98,6 +127,7 @@ functions:
       - http:
           path: accounts/{accountId}/withdrawals
           method: post
+          authorizer: jwtAuthorizer
 
   transfer:
     handler: src/handlers/transactions.transfer
@@ -105,3 +135,4 @@ functions:
       - http:
           path: transfers
           method: post
+          authorizer: jwtAuthorizer

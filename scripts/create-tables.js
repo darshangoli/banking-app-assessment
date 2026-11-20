@@ -12,6 +12,7 @@ const region = process.env.AWS_REGION || "us-east-1";
 const customersTable = process.env.CUSTOMERS_TABLE || "Customers";
 const accountsTable = process.env.ACCOUNTS_TABLE || "Accounts";
 const idempotencyTable = process.env.IDEMPOTENCY_TABLE || "Idempotency";
+const usersTable       = process.env.USERS_TABLE       || "Users";
 
 const client = new DynamoDBClient({
   region,
@@ -78,6 +79,25 @@ async function main() {
     TableName: idempotencyTable,
     AttributeDefinitions: [{ AttributeName: "idempotencyKey", AttributeType: "S" }],
     KeySchema: [{ AttributeName: "idempotencyKey", KeyType: "HASH" }],
+    BillingMode: "PAY_PER_REQUEST",
+  });
+
+  // Users table — stores hashed credentials keyed by customerId.
+  // EmailIndex GSI enables lookup by email during login.
+  await recreateTable(usersTable, {
+    TableName: usersTable,
+    AttributeDefinitions: [
+      { AttributeName: "customerId", AttributeType: "S" },
+      { AttributeName: "email",      AttributeType: "S" },
+    ],
+    KeySchema: [{ AttributeName: "customerId", KeyType: "HASH" }],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: "EmailIndex",
+        KeySchema: [{ AttributeName: "email", KeyType: "HASH" }],
+        Projection: { ProjectionType: "ALL" },
+      },
+    ],
     BillingMode: "PAY_PER_REQUEST",
   });
 

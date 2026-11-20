@@ -4,6 +4,7 @@ const { ok, badRequest, notFound, conflict, serverError, parseJsonBody } = requi
 const { docClient, TABLES } = require("../lib/dynamodb");
 const { GetCommand, TransactWriteCommand } = require("@aws-sdk/lib-dynamodb");
 const { validateAmount } = require("../lib/validate");
+const { requireAuth } = require("../lib/auth-middleware");
 const {
   buildIdempotencyClaimItem,
   resolveIdempotency,
@@ -59,7 +60,7 @@ async function runWithIdempotency(key, buildTransactItems, recoveryMeta, buildSu
         new TransactWriteCommand({ TransactItems: buildTransactItems() })
       );
     } catch (err) {
-      return handleTransactionError(err, 1); // business items start at index 0
+      return handleTransactionError(err, 0); // no idempotency item, business items start at index 0
     }
     return buildSuccessResponse();
   }
@@ -178,6 +179,9 @@ function handleTransactionError(err, businessStartIndex = 0) {
  *   self-heals by verifying the account balance
  */
 async function deposit(event) {
+  const authResult = requireAuth(event);
+  if (authResult.error) return authResult.error;
+
   const accountId = event.pathParameters?.accountId;
   if (!accountId) return badRequest("accountId path parameter is required");
 
@@ -255,6 +259,9 @@ async function deposit(event) {
  * - Crash-safe: self-heals on the next retry via balance verification
  */
 async function withdraw(event) {
+  const authResult = requireAuth(event);
+  if (authResult.error) return authResult.error;
+
   const accountId = event.pathParameters?.accountId;
   if (!accountId) return badRequest("accountId path parameter is required");
 
@@ -328,6 +335,9 @@ async function withdraw(event) {
  * - Returns 200: { fromAccount, toAccount }
  */
 async function transfer(event) {
+  const authResult = requireAuth(event);
+  if (authResult.error) return authResult.error;
+
   const parsed = parseJsonBody(event);
   if (!parsed.ok) return parsed.response;
 

@@ -22,9 +22,10 @@ const docClient = DynamoDBDocumentClient.from(client, {
 });
 
 const TABLES = {
-  customers: process.env.CUSTOMERS_TABLE || "Customers",
-  accounts: process.env.ACCOUNTS_TABLE || "Accounts",
+  customers:   process.env.CUSTOMERS_TABLE   || "Customers",
+  accounts:    process.env.ACCOUNTS_TABLE    || "Accounts",
   idempotency: process.env.IDEMPOTENCY_TABLE || "Idempotency",
+  users:       process.env.USERS_TABLE       || "Users",
 };
 
 module.exports = {
